@@ -10,8 +10,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 const apk = resolve(process.argv[2] ?? "");
 if (!apk || !existsSync(apk)) {
@@ -31,7 +32,6 @@ function listing(archive) {
 const entries = listing(apk);
 const errors = [];
 
-// Managed runtime (preferred path for BachataS4).
 const hasManifest = entries.includes("assets/runtime/manifest.json");
 const hasRuntimeZip = entries.includes("assets/runtime/runtime.zip");
 const jniLibs = entries.filter(
@@ -50,26 +50,17 @@ if (hasManifest !== hasRuntimeZip) {
   );
 }
 
-// Optional host loader — present when package-runtime stages jniLibs.
-const hostLoader = "lib/arm64-v8a/libbachata_host_loader.so";
-const box64 = "lib/arm64-v8a/libbox64.so";
 if (jniLibs.length > 0) {
   const names = jniLibs.map((e) => e.split("/").at(-1));
   console.log(`jniLibs arm64-v8a: ${names.join(", ")}`);
 }
 
 if (hasRuntimeZip) {
-  // Spot-check nested ZIP for FEX/Box64 host runners when present in package.
   try {
     const nested = execFileSync("unzip", ["-p", apk, "assets/runtime/runtime.zip"], {
       encoding: "buffer",
       maxBuffer: 256 * 1024 * 1024,
     });
-    // Write to pipe via unzip -l on a temp approach: list nested via unzip -Z1 after extract is heavy.
-    // Instead use unzip -l on the APK member is not supported; extract listing with python-free method:
-    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
     const dir = mkdtempSync(join(tmpdir(), "bachata-native-fix-"));
     try {
       const zipPath = join(dir, "runtime.zip");
