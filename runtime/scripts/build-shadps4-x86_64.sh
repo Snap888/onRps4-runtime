@@ -59,7 +59,8 @@ for bachata_patch in \
   "$project_root/runtime/patches/shadps4-linker-fex-object-resolution.patch" \
   "$project_root/runtime/patches/shadps4-vk-presenter-nonblocking-fence.patch" \
   "$project_root/runtime/patches/shadps4-videoout-flip-requeue.patch" \
-  "$project_root/runtime/patches/bachata-fex-hle-unimplemented-returns-zero.patch"
+  "$project_root/runtime/patches/bachata-fex-hle-unimplemented-returns-zero.patch" \
+  "$project_root/runtime/patches/imgui-filedialog-childflags.patch"
 do
   if git -C "$shadps4_src_dir" apply --reverse --check "$bachata_patch"; then
     echo "Bachata patch $(basename "$bachata_patch") already applied"
