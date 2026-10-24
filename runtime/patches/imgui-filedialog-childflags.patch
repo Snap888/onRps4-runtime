@@ -1,5 +1,5 @@
---- a/ImGuiFileDialog.cpp
-+++ b/ImGuiFileDialog.cpp
+--- a/externals/ImGuiFileDialog/ImGuiFileDialog.cpp
++++ b/externals/ImGuiFileDialog/ImGuiFileDialog.cpp
 @@ -4242,7 +4242,7 @@
      // we need to set the child flags for the next window data
      // because we use BeginChild and we need to set the NavFlattened flag
