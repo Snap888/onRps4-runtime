@@ -113,7 +113,6 @@ jobs:
           java-version: "17"
 
       # Do not install the obsolete "tools" package (removed from current SDK repos).
-      # ubuntu-24.04 already ships cmdline-tools; we only accept licenses here.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -122,13 +121,65 @@ jobs:
       - name: Install Android SDK components
         run: |
           set -euo pipefail
-          # Licenses first so subsequent installs are non-interactive
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          echo "ANDROID_HOME=$SDK"
+
+          # Refresh cmdline-tools so the package index includes current platforms (API 37+).
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install \
-            "platforms;android-37" \
-            "build-tools;35.0.0" \
-            "ndk;29.0.14206865" \
-            "cmake;3.22.1"
+          sdkmanager --install "cmdline-tools;latest" || true
+
+          # Prefer the freshly installed cmdline-tools on PATH
+          if [ -d "$SDK/cmdline-tools/latest/bin" ]; then
+            export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          fi
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          # Platform matching BachataS4 compileSdk/targetSdk = 37.
+          # Fall back to 36/35 only if 37 is not published on this index yet
+          # (Gradle would still need 37 for a full compile — fail clearly if missing).
+          PLATFORM=""
+          for candidate in "platforms;android-37" "platforms;android-36" "platforms;android-35"; do
+            if sdkmanager --install "$candidate"; then
+              PLATFORM="$candidate"
+              echo "Installed $PLATFORM"
+              break
+            else
+              echo "Package not available: $candidate"
+            fi
+          done
+          if [ -z "$PLATFORM" ]; then
+            echo "Available platform packages:"
+            sdkmanager --list 2>/dev/null | grep -E 'platforms;android-' | head -40 || true
+            exit 1
+          fi
+          if [ "$PLATFORM" != "platforms;android-37" ]; then
+            echo "::warning::platforms;android-37 unavailable; installed $PLATFORM. compileSdk=37 may still fail until API 37 is published."
+          fi
+
+          # Build-tools / NDK / CMake — try pinned versions, then common fallbacks
+          sdkmanager --install "build-tools;35.0.0" || sdkmanager --install "build-tools;34.0.0"
+
+          NDK_VER=""
+          for ndk in "ndk;29.0.14206865" "ndk;28.2.13676358" "ndk;27.2.12479018"; do
+            if sdkmanager --install "$ndk"; then
+              NDK_VER="${ndk#ndk;}"
+              echo "Installed NDK $NDK_VER"
+              break
+            fi
+          done
+          if [ -n "$NDK_VER" ]; then
+            echo "NDK_VERSION=$NDK_VER" >> "$GITHUB_ENV"
+            echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No NDK package installed; prebuilt jniLibs may still assemble."
+          fi
+
+          sdkmanager --install "cmake;3.22.1" || sdkmanager --install "cmake;3.31.0" || true
+
+          echo "Installed SDK packages:"
+          ls -la "$SDK/platforms" || true
+          ls -la "$SDK/ndk" || true
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -144,13 +195,15 @@ jobs:
         working-directory: runtime/sources/shadps4/android/BachataS4
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euo pipefail
           FLAVOR="${{ github.event.inputs.flavor || 'playstore' }}"
           VARIANT="${{ github.event.inputs.variant || 'debug' }}"
           TASK="assemble${FLAVOR^}${VARIANT^}"
           echo "Running ./gradlew $TASK"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
           chmod +x gradlew
           ./gradlew "$TASK" --stacktrace --no-daemon
 
