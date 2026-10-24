@@ -98,34 +98,37 @@ jobs:
               exit 1
             }
 
-      - name: Place runtime assets into Android project
+            # Docker runs as root; reassign ownership so the GHA runner user can
+            # read/copy these files in subsequent steps (and Gradle can package them).
+            HOST_UID=$(stat -c '%u' /workspace)
+            HOST_GID=$(stat -c '%g' /workspace)
+            chown -R "$HOST_UID:$HOST_GID" \
+              "$OUT_DIR" \
+              "$APP_ROOT/app/src/main/assets" \
+              "$APP_ROOT/app/src/main/jniLibs" \
+              app/src/main/assets 2>/dev/null || true
+            chown -R "$HOST_UID:$HOST_GID" app/src/main/jniLibs 2>/dev/null || true
+            # Also fix anything under runtime/build that later steps may touch
+            chown -R "$HOST_UID:$HOST_GID" runtime/build 2>/dev/null || true
+
+      - name: Verify runtime assets on host
         run: |
           set -euo pipefail
           APP_ROOT="runtime/sources/shadps4/android/BachataS4"
           ASSETS_DIR="$APP_ROOT/app/src/main/assets/runtime"
           JNI_DIR="$APP_ROOT/app/src/main/jniLibs/arm64-v8a"
-          OUT_DIR="runtime/build/runtime-out"
-
-          mkdir -p "$ASSETS_DIR" "$JNI_DIR"
-
-          # Idempotent copy if the docker step already staged files
-          if [ -d "$OUT_DIR" ]; then
-            cp -a "$OUT_DIR"/. "$ASSETS_DIR/"
-          fi
-          if [ -d app/src/main/jniLibs/arm64-v8a ]; then
-            cp -a app/src/main/jniLibs/arm64-v8a/. "$JNI_DIR/"
-          fi
-          if [ -d app/src/main/assets/runtime ]; then
-            cp -a app/src/main/assets/runtime/. "$ASSETS_DIR/"
-          fi
 
           echo "Assets present on host:"
           ls -la "$ASSETS_DIR"
           ls -la "$JNI_DIR" || true
+
           if [ ! -f "$ASSETS_DIR/manifest.json" ] && [ ! -f "$ASSETS_DIR/runtime.zip" ]; then
             echo "ERROR: runtime assets missing after docker package step" >&2
             exit 1
           fi
+
+          # Ensure runner can read everything Gradle will package
+          test -r "$ASSETS_DIR/runtime.zip" || test -r "$ASSETS_DIR/manifest.json"
 
       # ---- Android SDK / NDK / Gradle ----
       - name: Set up JDK 17
