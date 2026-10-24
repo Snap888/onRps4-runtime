@@ -1,0 +1,160 @@
+name: build-apk
+
+# Builds the BachataS4 Android APK (playstoreDebug by default).
+# 1) Builds the managed runtime (box64 + shadPS4 + rootfs) in Debian Trixie
+# 2) Packages runtime.zip + manifest + host jniLibs into the Android app tree
+# 3) Assembles the APK with Gradle and uploads the artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Product flavor"
+        required: true
+        default: "playstore"
+        type: choice
+        options:
+          - playstore
+          - fdroid
+      variant:
+        description: "Build variant"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    branches:
+      - ps4emu
+    paths:
+      - "runtime/**"
+      - "runtime/sources/shadps4/android/**"
+      - ".github/workflows/build-apk.yml"
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---- Runtime build (Debian Trixie container) ----
+      - name: Build runtime inside Debian Trixie
+        uses: addnab/docker-run-action@v3
+        with:
+          image: debian:trixie
+          options: -v ${{ github.workspace }}:/workspace -w /workspace
+          run: |
+            set -euo pipefail
+            apt-get update
+            apt-get install -y --no-install-recommends git nodejs ca-certificates python3
+            git config --global --add safe.directory /workspace
+
+            # Official dependency list for box64 / shadPS4 / cross toolchain
+            bash runtime/scripts/install-debian-runtime-deps.sh
+
+            # Clean partial submodule clones that break populate
+            find runtime/sources/shadps4/externals -maxdepth 1 -type d -empty -delete || true
+            rm -rf runtime/sources/shadps4/externals/zlib-ng
+
+            python3 runtime/scripts/populate-shadps4-submodules.py runtime/sources/shadps4
+
+            # Build everything and package into a temporary dir first
+            mkdir -p /tmp/runtime-out
+            bash runtime/scripts/build-runtime-debian.sh
+            # package-runtime defaults to app/src/main/assets/runtime at repo root;
+            # we re-point it to the nested Android project path afterwards.
+            node runtime/scripts/package-runtime.mjs /tmp/runtime-out
+
+      - name: Place runtime assets into Android project
+        run: |
+          set -euo pipefail
+          APP_ROOT="runtime/sources/shadps4/android/BachataS4"
+          ASSETS_DIR="$APP_ROOT/app/src/main/assets/runtime"
+          JNI_DIR="$APP_ROOT/app/src/main/jniLibs/arm64-v8a"
+
+          mkdir -p "$ASSETS_DIR" "$JNI_DIR"
+
+          # From the Debian step the packaged files live under /tmp/runtime-out
+          # but docker-run-action keeps the workspace volume; the package step
+          # also wrote jniLibs to the default app/ path. Copy both.
+          if [ -d /tmp/runtime-out ]; then
+            cp -a /tmp/runtime-out/. "$ASSETS_DIR/"
+          fi
+
+          # package-runtime.mjs also writes host libs to app/src/main/jniLibs
+          if [ -d app/src/main/jniLibs/arm64-v8a ]; then
+            cp -a app/src/main/jniLibs/arm64-v8a/. "$JNI_DIR/"
+          fi
+
+          # Also copy any staged runtime that may have landed at the default location
+          if [ -d app/src/main/assets/runtime ]; then
+            cp -a app/src/main/assets/runtime/. "$ASSETS_DIR/"
+          fi
+
+          echo "Assets present:"
+          ls -la "$ASSETS_DIR" || true
+          ls -la "$JNI_DIR" || true
+
+      # ---- Android SDK / NDK / Gradle ----
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-37" \
+            "build-tools;35.0.0" \
+            "ndk;29.0.14206865" \
+            "cmake;3.22.1"
+          # Accept licenses
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('runtime/sources/shadps4/android/BachataS4/**/*.gradle*', 'runtime/sources/shadps4/android/BachataS4/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Assemble APK
+        working-directory: runtime/sources/shadps4/android/BachataS4
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+        run: |
+          set -euo pipefail
+          FLAVOR="${{ github.event.inputs.flavor || 'playstore' }}"
+          VARIANT="${{ github.event.inputs.variant || 'debug' }}"
+          TASK="assemble${FLAVOR^}${VARIANT^}"
+          echo "Running ./gradlew $TASK"
+          chmod +x gradlew
+          ./gradlew "$TASK" --stacktrace --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bachatas4-${{ github.event.inputs.flavor || 'playstore' }}-${{ github.event.inputs.variant || 'debug' }}
+          path: |
+            runtime/sources/shadps4/android/BachataS4/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
