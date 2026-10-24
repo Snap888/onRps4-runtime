@@ -68,12 +68,35 @@ jobs:
 
             python3 runtime/scripts/populate-shadps4-submodules.py runtime/sources/shadps4
 
-            # Build everything and package into a temporary dir first
-            mkdir -p /tmp/runtime-out
             bash runtime/scripts/build-runtime-debian.sh
-            # package-runtime defaults to app/src/main/assets/runtime at repo root;
-            # we re-point it to the nested Android project path afterwards.
-            node runtime/scripts/package-runtime.mjs /tmp/runtime-out
+
+            # MUST write into the mounted workspace — container /tmp is discarded.
+            APP_ROOT="runtime/sources/shadps4/android/BachataS4"
+            ASSETS_DIR="$APP_ROOT/app/src/main/assets/runtime"
+            JNI_DIR="$APP_ROOT/app/src/main/jniLibs/arm64-v8a"
+            OUT_DIR="runtime/build/runtime-out"
+            mkdir -p "$OUT_DIR" "$ASSETS_DIR" "$JNI_DIR"
+
+            node runtime/scripts/package-runtime.mjs "$OUT_DIR"
+
+            # Stage into the Android app tree (same filesystem = survives container exit)
+            cp -a "$OUT_DIR"/. "$ASSETS_DIR/"
+
+            # package-runtime may also emit host jniLibs at the default app/ path
+            if [ -d app/src/main/jniLibs/arm64-v8a ]; then
+              cp -a app/src/main/jniLibs/arm64-v8a/. "$JNI_DIR/"
+            fi
+            if [ -d app/src/main/assets/runtime ]; then
+              cp -a app/src/main/assets/runtime/. "$ASSETS_DIR/"
+            fi
+
+            echo "Packaged runtime assets:"
+            ls -la "$ASSETS_DIR"
+            ls -la "$JNI_DIR" || true
+            test -f "$ASSETS_DIR/manifest.json" || test -f "$ASSETS_DIR/runtime.zip" || {
+              echo "ERROR: neither manifest.json nor runtime.zip in $ASSETS_DIR" >&2
+              exit 1
+            }
 
       - name: Place runtime assets into Android project
         run: |
@@ -81,29 +104,28 @@ jobs:
           APP_ROOT="runtime/sources/shadps4/android/BachataS4"
           ASSETS_DIR="$APP_ROOT/app/src/main/assets/runtime"
           JNI_DIR="$APP_ROOT/app/src/main/jniLibs/arm64-v8a"
+          OUT_DIR="runtime/build/runtime-out"
 
           mkdir -p "$ASSETS_DIR" "$JNI_DIR"
 
-          # From the Debian step the packaged files live under /tmp/runtime-out
-          # but docker-run-action keeps the workspace volume; the package step
-          # also wrote jniLibs to the default app/ path. Copy both.
-          if [ -d /tmp/runtime-out ]; then
-            cp -a /tmp/runtime-out/. "$ASSETS_DIR/"
+          # Idempotent copy if the docker step already staged files
+          if [ -d "$OUT_DIR" ]; then
+            cp -a "$OUT_DIR"/. "$ASSETS_DIR/"
           fi
-
-          # package-runtime.mjs also writes host libs to app/src/main/jniLibs
           if [ -d app/src/main/jniLibs/arm64-v8a ]; then
             cp -a app/src/main/jniLibs/arm64-v8a/. "$JNI_DIR/"
           fi
-
-          # Also copy any staged runtime that may have landed at the default location
           if [ -d app/src/main/assets/runtime ]; then
             cp -a app/src/main/assets/runtime/. "$ASSETS_DIR/"
           fi
 
-          echo "Assets present:"
-          ls -la "$ASSETS_DIR" || true
+          echo "Assets present on host:"
+          ls -la "$ASSETS_DIR"
           ls -la "$JNI_DIR" || true
+          if [ ! -f "$ASSETS_DIR/manifest.json" ] && [ ! -f "$ASSETS_DIR/runtime.zip" ]; then
+            echo "ERROR: runtime assets missing after docker package step" >&2
+            exit 1
+          fi
 
       # ---- Android SDK / NDK / Gradle ----
       - name: Set up JDK 17
@@ -153,8 +175,6 @@ jobs:
             return 1
           }
 
-          # Platform for compileSdk/targetSdk=37. Try 37 first; AGP can also
-          # download it later if licenses are accepted. Fallbacks keep the step green.
           PLATFORM_OK=0
           for candidate in "platforms;android-37" "platforms;android-36" "platforms;android-35"; do
             if install_pkg "$candidate"; then
@@ -163,9 +183,8 @@ jobs:
             fi
           done
           if [ "$PLATFORM_OK" -ne 1 ]; then
-            echo "No platform package preinstalled; listing available platforms:"
+            echo "No platform package preinstalled; AGP may download platforms;android-37 during Gradle."
             sdkmanager --list 2>/dev/null | grep -E 'platforms;android-' | head -40 || true
-            echo "Continuing — AGP may download platforms;android-37 during Gradle."
           fi
 
           install_pkg "build-tools;35.0.0" || install_pkg "build-tools;34.0.0" || true
