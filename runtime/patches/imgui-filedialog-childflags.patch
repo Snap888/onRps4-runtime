@@ -1,0 +1,11 @@
+--- a/ImGuiFileDialog.cpp
++++ b/ImGuiFileDialog.cpp
+@@ -4242,7 +4242,7 @@
+     // we need to set the child flags for the next window data
+     // because we use BeginChild and we need to set the NavFlattened flag
+     g.NextWindowData.HasFlags |= ImGuiNextWindowDataFlags_HasChildFlags;
+-    g.NextWindowData.ChildFlagsSet |= ImGuiChildFlags_NavFlattened;
++    g.NextWindowData.ChildFlags |= ImGuiChildFlags_NavFlattened;
+ }
+ 
+ void IGFD::FileDialog::m_DrawHeader() {
