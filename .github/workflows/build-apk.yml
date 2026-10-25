@@ -6,7 +6,8 @@ name: build-apk
 #   3) bundle   — collect APK + runtime into one downloadable artifact set
 #
 # Each job uploads its own artifacts so a failed APK step does not discard a
-# successful ~50 min runtime build (re-run only the apk job after a fix).
+# successful ~50 min runtime build. Re-run only the failed job from the Actions UI
+# after a fix (runtime-bundle stays available for the run).
 
 on:
   workflow_dispatch:
@@ -27,11 +28,6 @@ on:
         options:
           - debug
           - release
-      skip_runtime:
-        description: "Skip runtime job and reuse artifact from a prior run (artifact name runtime-bundle)"
-        required: false
-        default: false
-        type: boolean
   push:
     branches:
       - ps4emu
@@ -52,11 +48,8 @@ jobs:
   # Job 1: managed runtime (long-running Debian cross build)
   # ---------------------------------------------------------------------------
   runtime:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_runtime != true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    outputs:
-      bundle_name: runtime-bundle
 
     steps:
       - name: Checkout
@@ -122,12 +115,6 @@ jobs:
   # ---------------------------------------------------------------------------
   apk:
     needs: [runtime]
-    # Always run when runtime succeeded; also allow a manual path that only
-    # builds the APK if skip_runtime was requested (runtime job skipped).
-    if: |
-      always() &&
-      (needs.runtime.result == 'success' ||
-       (github.event_name == 'workflow_dispatch' && inputs.skip_runtime == true))
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -255,10 +242,6 @@ jobs:
   # ---------------------------------------------------------------------------
   bundle:
     needs: [runtime, apk]
-    if: |
-      always() &&
-      needs.apk.result == 'success' &&
-      (needs.runtime.result == 'success' || needs.runtime.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -281,15 +264,18 @@ jobs:
           mkdir -p dist/release
           find dist/apk -type f -name '*.apk' -exec cp -a {} dist/release/ \;
           mkdir -p dist/release/runtime
-          cp -a dist/runtime/assets/runtime/. dist/release/runtime/ 2>/dev/null || \
+          if [ -d dist/runtime/assets/runtime ]; then
+            cp -a dist/runtime/assets/runtime/. dist/release/runtime/
+          else
             cp -a dist/runtime/. dist/release/runtime/
+          fi
           if [ -d dist/runtime/jniLibs ]; then
             mkdir -p dist/release/jniLibs
             cp -a dist/runtime/jniLibs/. dist/release/jniLibs/
           fi
           echo "Release contents:"
           find dist/release -type f | sort | head -50
-          du -sh dist/release/*
+          du -sh dist/release/* || true
 
       - name: Upload final-release
         uses: actions/upload-artifact@v4
