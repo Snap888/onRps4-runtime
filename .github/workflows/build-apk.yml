@@ -124,6 +124,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # core/runtime CMake pulls shadPS4 externals (libdeflate, winlator-app/libadrenotools, …).
+      # Those directories are git submodules and are NOT part of runtime-bundle — populate here.
+      - name: Populate shadPS4 externals for Android native build
+        run: |
+          set -euo pipefail
+          find runtime/sources/shadps4/externals -maxdepth 1 -type d -empty -delete || true
+          rm -rf runtime/sources/shadps4/externals/zlib-ng
+          python3 runtime/scripts/populate-shadps4-submodules.py runtime/sources/shadps4
+          # Paths required by core/runtime/src/main/cpp/CMakeLists.txt
+          test -d runtime/sources/shadps4/externals/libdeflate
+          test -d runtime/sources/shadps4/externals/winlator-app/app/src/main/cpp/libadrenotools \
+            || test -d runtime/sources/shadps4/externals/winlator-app
+          ls runtime/sources/shadps4/externals | head -40
+
       - name: Download runtime-bundle
         uses: actions/download-artifact@v4
         with:
