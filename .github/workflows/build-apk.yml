@@ -1,13 +1,16 @@
 name: build-apk
 
 # Multi-job pipeline:
-#   1) runtime  — Debian Trixie: box64 + shadPS4 + rootfs → runtime.zip / manifest / jniLibs
-#   2) apk      — Android Gradle: stage runtime assets → assemble APK
-#   3) bundle   — collect APK + runtime into one downloadable artifact set
+#   1) runtime       — build runtime in Debian, OR
+#      fetch-runtime — download runtime-bundle.zip from a GitHub Release
+#   2) apk           — stage runtime + Gradle assemble
+#   3) bundle        — APK + runtime side-by-side (Actions artifact)
+#   4) publish       — optional GitHub Release with APK + runtime-bundle.zip
 #
-# Each job uploads its own artifacts so a failed APK step does not discard a
-# successful ~50 min runtime build. Re-run only the failed job from the Actions UI
-# after a fix (runtime-bundle stays available for the run).
+# Manual run (Actions → build-apk → Run workflow):
+#   runtime_source = build          → full rebuild (~50 min runtime + APK)
+#   runtime_source = from_release   → skip runtime; pick release_tag
+#   publish_release = true          → create/update GitHub Release
 
 on:
   workflow_dispatch:
@@ -28,6 +31,29 @@ on:
         options:
           - debug
           - release
+      runtime_source:
+        description: "Where to get the managed runtime"
+        required: true
+        default: "build"
+        type: choice
+        options:
+          - build
+          - from_release
+      release_tag:
+        description: "Release tag with runtime-bundle.zip (from_release). Empty = latest release that has the asset"
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "Publish APK + runtime-bundle.zip to a GitHub Release"
+        required: false
+        default: true
+        type: boolean
+      publish_tag:
+        description: "Tag for the new/updated release (empty = auto runtime-YYYYMMDD-HHMMSS or reuse release_tag)"
+        required: false
+        default: ""
+        type: string
   push:
     branches:
       - ps4emu
@@ -40,14 +66,21 @@ concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+  actions: read
+
 env:
   APP_ROOT: runtime/sources/shadps4/android/BachataS4
+  FLAVOR: ${{ github.event.inputs.flavor || 'playstore' }}
+  VARIANT: ${{ github.event.inputs.variant || 'debug' }}
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1: managed runtime (long-running Debian cross build)
+  # Job 1a: build managed runtime from source
   # ---------------------------------------------------------------------------
   runtime:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.runtime_source == 'build' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -81,7 +114,6 @@ jobs:
             mkdir -p "$OUT_DIR" "$STAGE_DIR/assets/runtime" "$STAGE_DIR/jniLibs/arm64-v8a"
 
             node runtime/scripts/package-runtime.mjs "$OUT_DIR"
-
             cp -a "$OUT_DIR"/. "$STAGE_DIR/assets/runtime/"
 
             if [ -d app/src/main/jniLibs/arm64-v8a ]; then
@@ -94,7 +126,6 @@ jobs:
             echo "Staged runtime:"
             ls -la "$STAGE_DIR/assets/runtime"
             ls -la "$STAGE_DIR/jniLibs/arm64-v8a" || true
-
             test -f "$STAGE_DIR/assets/runtime/manifest.json"
             test -f "$STAGE_DIR/assets/runtime/runtime.zip"
 
@@ -102,19 +133,118 @@ jobs:
             HOST_GID=$(stat -c '%g' /workspace)
             chown -R "$HOST_UID:$HOST_GID" runtime/build "$STAGE_DIR"
 
-      - name: Upload runtime-bundle
+      - name: Upload runtime-bundle (Actions artifact)
         uses: actions/upload-artifact@v4
         with:
           name: runtime-bundle
           path: runtime/build/ci-stage/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+      - name: Pack runtime-bundle.zip for GitHub Releases
+        run: |
+          set -euo pipefail
+          cd runtime/build/ci-stage
+          zip -r -9 "$GITHUB_WORKSPACE/runtime-bundle.zip" .
+          ls -lh "$GITHUB_WORKSPACE/runtime-bundle.zip"
+
+      - name: Upload runtime-bundle.zip (Actions artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-bundle-zip
+          path: runtime-bundle.zip
+          if-no-files-found: error
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Job 2: Android APK (depends on runtime-bundle)
+  # Job 1b: fetch runtime-bundle.zip from an existing GitHub Release
+  # ---------------------------------------------------------------------------
+  fetch-runtime:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.runtime_source == 'from_release' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve release and download runtime-bundle.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p runtime/build/ci-stage download
+
+          if [ -n "$REQUESTED_TAG" ]; then
+            echo "Using release tag: $REQUESTED_TAG"
+            TAG="$REQUESTED_TAG"
+            # Verify asset exists
+            gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
+              --jq '.assets[].name' | tee /tmp/assets.txt
+            grep -qx 'runtime-bundle.zip' /tmp/assets.txt \
+              || { echo "ERROR: release $TAG has no runtime-bundle.zip asset"; exit 1; }
+          else
+            echo "Searching latest release that contains runtime-bundle.zip…"
+            TAG=""
+            # Walk releases newest-first
+            while read -r t; do
+              [ -z "$t" ] && continue
+              if gh api "repos/${{ github.repository }}/releases/tags/${t}" \
+                   --jq '.assets[].name' | grep -qx 'runtime-bundle.zip'; then
+                TAG="$t"
+                break
+              fi
+            done < <(gh api "repos/${{ github.repository }}/releases?per_page=30" --jq '.[].tag_name')
+            if [ -z "$TAG" ]; then
+              echo "ERROR: no release with runtime-bundle.zip found"
+              exit 1
+            fi
+            echo "Selected tag: $TAG"
+          fi
+
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "runtime-bundle.zip" \
+            --dir download
+
+          unzip -q download/runtime-bundle.zip -d runtime/build/ci-stage
+          echo "Extracted:"
+          find runtime/build/ci-stage -maxdepth 3 -type f | head -40
+          test -f runtime/build/ci-stage/assets/runtime/runtime.zip \
+            || test -f runtime/build/ci-stage/runtime.zip
+
+          # Normalize layout if zip was packed from assets/ root only
+          if [ ! -d runtime/build/ci-stage/assets/runtime ] && [ -f runtime/build/ci-stage/runtime.zip ]; then
+            mkdir -p runtime/build/ci-stage/assets/runtime
+            mv runtime/build/ci-stage/runtime.zip runtime/build/ci-stage/manifest.json \
+              runtime/build/ci-stage/assets/runtime/ 2>/dev/null || true
+          fi
+
+          cp -a download/runtime-bundle.zip "$GITHUB_WORKSPACE/runtime-bundle.zip"
+
+      - name: Upload runtime-bundle (Actions artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-bundle
+          path: runtime/build/ci-stage/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload runtime-bundle.zip (Actions artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-bundle-zip
+          path: runtime-bundle.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Android APK
   # ---------------------------------------------------------------------------
   apk:
-    needs: [runtime]
+    needs: [runtime, fetch-runtime]
+    if: |
+      always() &&
+      (needs.runtime.result == 'success' || needs.fetch-runtime.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -124,19 +254,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      # core/runtime CMake pulls shadPS4 externals (libdeflate, winlator-app/libadrenotools, …).
-      # Those directories are git submodules and are NOT part of runtime-bundle — populate here.
       - name: Populate shadPS4 externals for Android native build
         run: |
           set -euo pipefail
           find runtime/sources/shadps4/externals -maxdepth 1 -type d -empty -delete || true
           rm -rf runtime/sources/shadps4/externals/zlib-ng
           python3 runtime/scripts/populate-shadps4-submodules.py runtime/sources/shadps4
-          # Paths required by core/runtime/src/main/cpp/CMakeLists.txt
           test -d runtime/sources/shadps4/externals/libdeflate
           test -d runtime/sources/shadps4/externals/winlator-app/app/src/main/cpp/libadrenotools \
             || test -d runtime/sources/shadps4/externals/winlator-app
-          ls runtime/sources/shadps4/externals | head -40
 
       - name: Download runtime-bundle
         uses: actions/download-artifact@v4
@@ -152,7 +278,17 @@ jobs:
           STAGE="runtime/build/ci-stage"
 
           mkdir -p "$ASSETS_DIR" "$JNI_DIR"
-          cp -a "$STAGE/assets/runtime"/. "$ASSETS_DIR/"
+
+          if [ -d "$STAGE/assets/runtime" ]; then
+            cp -a "$STAGE/assets/runtime"/. "$ASSETS_DIR/"
+          elif [ -f "$STAGE/runtime.zip" ]; then
+            cp -a "$STAGE"/. "$ASSETS_DIR/"
+          else
+            echo "Unexpected runtime-bundle layout:" >&2
+            find "$STAGE" | head -50 >&2
+            exit 1
+          fi
+
           if [ -d "$STAGE/jniLibs/arm64-v8a" ]; then
             cp -a "$STAGE/jniLibs/arm64-v8a"/. "$JNI_DIR/"
           fi
@@ -235,8 +371,6 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -euo pipefail
-          FLAVOR="${{ github.event.inputs.flavor || 'playstore' }}"
-          VARIANT="${{ github.event.inputs.variant || 'debug' }}"
           TASK="assemble${FLAVOR^}${VARIANT^}"
           echo "Running ./gradlew $TASK"
           chmod +x gradlew
@@ -245,17 +379,21 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bachatas4-${{ github.event.inputs.flavor || 'playstore' }}-${{ github.event.inputs.variant || 'debug' }}
+          name: bachatas4-${{ env.FLAVOR }}-${{ env.VARIANT }}
           path: |
             ${{ env.APP_ROOT }}/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Job 3: final bundle — APK + runtime side-by-side for download
+  # Job 3: final Actions artifact (APK + runtime tree)
   # ---------------------------------------------------------------------------
   bundle:
-    needs: [runtime, apk]
+    needs: [runtime, fetch-runtime, apk]
+    if: |
+      always() &&
+      needs.apk.result == 'success' &&
+      (needs.runtime.result == 'success' || needs.fetch-runtime.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -263,7 +401,7 @@ jobs:
       - name: Download APK
         uses: actions/download-artifact@v4
         with:
-          name: bachatas4-${{ github.event.inputs.flavor || 'playstore' }}-${{ github.event.inputs.variant || 'debug' }}
+          name: bachatas4-${{ env.FLAVOR }}-${{ env.VARIANT }}
           path: dist/apk
 
       - name: Download runtime-bundle
@@ -291,10 +429,114 @@ jobs:
           find dist/release -type f | sort | head -50
           du -sh dist/release/* || true
 
-      - name: Upload final-release
+      - name: Upload final-release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: final-release-${{ github.event.inputs.flavor || 'playstore' }}-${{ github.event.inputs.variant || 'debug' }}
+          name: final-release-${{ env.FLAVOR }}-${{ env.VARIANT }}
           path: dist/release/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 4: publish GitHub Release (APK + runtime-bundle.zip)
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [runtime, fetch-runtime, apk, bundle]
+    if: |
+      always() &&
+      needs.apk.result == 'success' &&
+      needs.bundle.result == 'success' &&
+      (needs.runtime.result == 'success' || needs.fetch-runtime.result == 'success') &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish_release == true)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: bachatas4-${{ env.FLAVOR }}-${{ env.VARIANT }}
+          path: publish/apk
+
+      - name: Download runtime-bundle.zip
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-bundle-zip
+          path: publish
+
+      - name: Prepare release files
+        id: prep
+        run: |
+          set -euo pipefail
+          mkdir -p publish/out
+          APK=$(find publish/apk -type f -name '*.apk' | head -1)
+          test -n "$APK"
+          test -f publish/runtime-bundle.zip
+
+          FLAVOR="${FLAVOR}"
+          VARIANT="${VARIANT}"
+          APK_NAME="bachatas4-${FLAVOR}-${VARIANT}.apk"
+          cp -a "$APK" "publish/out/${APK_NAME}"
+          cp -a publish/runtime-bundle.zip publish/out/runtime-bundle.zip
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.publish_tag }}" ]; then
+            TAG="${{ inputs.publish_tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.runtime_source }}" = "from_release" ] && [ -n "${{ inputs.release_tag }}" ]; then
+            # APK-only rebuild against an existing runtime → tag as apk-<flavor>-<variant>-<runtime-tag>
+            TAG="apk-${FLAVOR}-${VARIANT}-${{ inputs.release_tag }}"
+          else
+            TAG="runtime-$(date -u +%Y%m%d-%H%M%S)"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          ls -lh publish/out/
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.prep.outputs.tag }}
+          APK_NAME: ${{ steps.prep.outputs.apk_name }}
+        run: |
+          set -euo pipefail
+          TITLE="onRps4 ${TAG} (${FLAVOR}/${VARIANT})"
+          NOTES="## Artifacts
+
+| File | Description |
+|------|-------------|
+| \"${APK_NAME}\" | BachataS4 Android APK (${FLAVOR}/${VARIANT}) |
+| \"runtime-bundle.zip\" | Managed runtime (runtime.zip + manifest + jniLibs) for reuse |
+
+### Rebuild APK only
+
+Actions → **build-apk** → Run workflow:
+- **runtime_source** = \"from_release\"
+- **release_tag** = \"${TAG}\"
+- **publish_release** = true/false as needed
+
+SHA: \"${{ github.sha }}\"
+Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+"
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG"
+            gh release upload "$TAG" \
+              "publish/out/${APK_NAME}" \
+              publish/out/runtime-bundle.zip \
+              --repo "${{ github.repository }}" \
+              --clobber
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --notes "$NOTES"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              "publish/out/${APK_NAME}" \
+              publish/out/runtime-bundle.zip \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --latest
+          fi
+
+          echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
