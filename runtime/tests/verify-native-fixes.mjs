@@ -9,8 +9,8 @@
  * Usage: node verify-native-fixes.mjs <path-to.apk>
  */
 
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, openSync, closeSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -27,6 +27,25 @@ function listing(archive) {
   })
     .split("\n")
     .filter(Boolean);
+}
+
+/** Extract one zip member to a file without buffering the whole payload in Node. */
+function extractMemberToFile(archive, member, destPath) {
+  const fd = openSync(destPath, "w");
+  try {
+    const result = spawnSync("unzip", ["-p", archive, member], {
+      stdio: ["ignore", fd, "pipe"],
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (result.status !== 0) {
+      const stderr = result.stderr?.toString?.() ?? "";
+      throw new Error(
+        `unzip -p ${member} failed (status=${result.status}): ${stderr.slice(0, 500)}`,
+      );
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const entries = listing(apk);
@@ -53,39 +72,35 @@ if (hasManifest !== hasRuntimeZip) {
 if (jniLibs.length > 0) {
   const names = jniLibs.map((e) => e.split("/").at(-1));
   console.log(`jniLibs arm64-v8a: ${names.join(", ")}`);
+} else {
+  console.log("jniLibs arm64-v8a: (none)");
 }
 
 if (hasRuntimeZip) {
+  const dir = mkdtempSync(join(tmpdir(), "bachata-native-fix-"));
   try {
-    const nested = execFileSync("unzip", ["-p", apk, "assets/runtime/runtime.zip"], {
-      encoding: "buffer",
-      maxBuffer: 256 * 1024 * 1024,
-    });
-    const dir = mkdtempSync(join(tmpdir(), "bachata-native-fix-"));
-    try {
-      const zipPath = join(dir, "runtime.zip");
-      writeFileSync(zipPath, nested);
-      const nestedEntries = listing(zipPath);
-      const interesting = [
-        "host/box64",
-        "host/fexcore-smoke",
-        "host/fexcore-guest-harness",
-        "host/shadps4-arm64-fex",
-        "bin/shadps4",
-      ].filter((p) => nestedEntries.includes(p));
-      console.log(
-        `runtime.zip entries: ${nestedEntries.length}; host runners: ${interesting.join(", ") || "(none)"}`,
+    const zipPath = join(dir, "runtime.zip");
+    extractMemberToFile(apk, "assets/runtime/runtime.zip", zipPath);
+    const nestedEntries = listing(zipPath);
+    const interesting = [
+      "host/box64",
+      "host/fexcore-smoke",
+      "host/fexcore-guest-harness",
+      "host/shadps4-arm64-fex",
+      "bin/shadps4",
+    ].filter((p) => nestedEntries.includes(p));
+    console.log(
+      `runtime.zip entries: ${nestedEntries.length}; host runners: ${interesting.join(", ") || "(none)"}`,
+    );
+    if (interesting.length === 0) {
+      errors.push(
+        "runtime.zip present but missing expected host runners (box64 / fexcore-smoke / shadps4)",
       );
-      if (interesting.length === 0) {
-        errors.push(
-          "runtime.zip present but missing expected host runners (box64 / fexcore-smoke / shadps4)",
-        );
-      }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
     }
   } catch (err) {
     errors.push(`Failed to inspect nested runtime.zip: ${err.message ?? err}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
